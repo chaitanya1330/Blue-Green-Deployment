@@ -1,0 +1,184 @@
+pipeline {
+    agent any
+    
+    tools{
+        maven 'maven3'
+    }
+    
+    parameters {
+        choice(name: 'DEPLOY_ENV', choices: ['blue', 'green'], description: 'Choose which environment to deploy: Blue or Green')
+        // choice(name: 'DOCKER_TAG', choices: ['blue', 'green'], description: 'Choose the Docker image tag for the deployment')
+        booleanParam(name: 'SWITCH_TRAFFIC', defaultValue: false, description: 'Switch traffic between Blue and Green')
+        string(name: 'DOCKER_TAG', defaultValue: 'latest', description: 'Tag for the Docker image')
+    }
+    
+    environment {
+        IMAGE_NAME = "chaitanyachay/bankapp"
+        TAG = "${params.DOCKER_TAG}"
+        KUBE_NAMESPACE = "webapps"
+    }
+
+    stages {
+        stage('Git checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'git-creds', url: 'https://github.com/chaitanya1330/Blue-Green-Deployment.git'
+            }
+        }
+        stage('Compile') {
+            steps {
+                sh 'mvn compile'
+            }
+        }
+        stage('testing') {
+            steps {
+                sh 'mvn test -DskipTests=true'
+            }
+        }
+        stage('trivy-scan') {
+            steps {
+                sh "trivy fs --format table -o fs.html ."
+            }
+        }
+        
+        stage('build') {
+            steps {
+                sh "mvn package -DskipTests=true"
+            }
+        }
+        
+        stage('Docker Build') {
+            steps {
+                script{
+                    withDockerRegistry(credentialsId: 'docker-hub') {
+                        sh """docker build -t ${IMAGE_NAME}:${TAG} ."""
+                    }
+                }
+            }
+        }
+        stage('image scan') {
+            steps {
+                sh """trivy image --format table -o dimage.html ${IMAGE_NAME}:${TAG}"""
+            }
+        }
+        stage('docker push') {
+            steps {
+                script{
+                    withDockerRegistry(credentialsId: 'docker-hub') {
+                        sh """docker push ${IMAGE_NAME}:${TAG}"""
+                    }
+                }
+            }
+        }
+        
+        stage('update manifests') {
+            steps {
+                script {
+                    withCredentials([gitUsernamePassword(credentialsId: 'git-creds', gitToolName: 'Default')]) {
+                        sh """
+                            # Ensure previous clone is removed to avoid nested structure issues
+                            rm -rf Blue-Green-Deployment
+                            
+                            # Clone the repository fresh
+                            git clone -b main https://github.com/chaitanya1330/Blue-Green-Deployment.git
+                            
+                            # Verify cloning success
+                            if [ ! -d "Blue-Green-Deployment" ]; then
+                                echo "Git clone failed!"
+                                exit 1
+                            fi
+        
+                            cd Blue-Green-Deployment
+                            
+                            # Verify directory content
+                            ls -l 
+        
+                            # Update image version
+                            sed -i 's|image: chaitanyachay/bankapp:[^ ]*|image: chaitanyachay/bankapp:${params.DOCKER_TAG}|' app-deployment-blue.yml
+        
+                            echo "Updated YAML file contents:"
+                            cat app-deployment-blue.yml 
+        
+                            git config user.name "Jenkins"
+                            git config user.email "vantaku.chaitanya@netscribes.com"
+                            git add app-deployment-blue.yml
+                            git commit -m "Update bankapp image to tag ${params.DOCKER_TAG}"
+                            git push https://github.com/chaitanya1330/Blue-Green-Deployment.git main
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy MySQL Deployment and Service') {
+            steps {
+                script {
+                    withKubeConfig(caCertificate: '', clusterName: 'devopsshack-cluster', contextName: '', credentialsId: 'k8s-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E014A3B65526B3A667A11B8EFA161C75.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh "kubectl apply -f mysql-ds.yml -n ${KUBE_NAMESPACE}"  // Ensure you have the MySQL deployment YAML ready
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy SVC-APP') {
+            steps {
+                script {
+                    withKubeConfig(caCertificate: '', clusterName: 'devopsshack-cluster', contextName: '', credentialsId: 'k8s-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E014A3B65526B3A667A11B8EFA161C75.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh """ if ! kubectl get svc bankapp-service -n ${KUBE_NAMESPACE}; then
+                                kubectl apply -f bankapp-service.yml -n ${KUBE_NAMESPACE}
+                              fi
+                        """
+                  }
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    def deploymentFile = ""
+                    if (params.DEPLOY_ENV == 'blue') {
+                        deploymentFile = 'app-deployment-blue.yml'
+                    } else {
+                        deploymentFile = 'app-deployment-green.yml'
+                    }
+
+                    withKubeConfig(caCertificate: '', clusterName: 'devopsshack-cluster', contextName: '', credentialsId: 'k8s-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E014A3B65526B3A667A11B8EFA161C75.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh "kubectl apply -f ${deploymentFile} -n ${KUBE_NAMESPACE}"
+                    }
+                }
+            }
+        }
+        
+        stage('Switch Traffic Between Blue & Green Environment') {
+            when {
+                expression { return params.SWITCH_TRAFFIC }
+            }
+            steps {
+                script {
+                    def newEnv = params.DEPLOY_ENV
+
+                    // Always switch traffic based on DEPLOY_ENV
+                    withKubeConfig(caCertificate: '', clusterName: 'devopsshack-cluster', contextName: '', credentialsId: 'k8s-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E014A3B65526B3A667A11B8EFA161C75.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh '''
+                            kubectl patch service bankapp-service -p "{\\"spec\\": {\\"selector\\": {\\"app\\": \\"bankapp\\", \\"version\\": \\"''' + newEnv + '''\\"}}}" -n ${KUBE_NAMESPACE}
+                        '''
+                    }
+                    echo "Traffic has been switched to the ${newEnv} environment."
+                }
+            }
+        }
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    def verifyEnv = params.DEPLOY_ENV
+                    withKubeConfig(caCertificate: '', clusterName: 'devopsshack-cluster', contextName: '', credentialsId: 'k8s-token', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://E014A3B65526B3A667A11B8EFA161C75.gr7.ap-south-1.eks.amazonaws.com') {
+                        sh """
+                        kubectl get pods -l version=${verifyEnv} -n ${KUBE_NAMESPACE}
+                        kubectl get svc bankapp-service -n ${KUBE_NAMESPACE}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
